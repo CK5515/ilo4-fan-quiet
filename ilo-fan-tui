@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""TUI for monitoring DL380p temps and adjusting iLO4 fan caps.
+
+Runs unprivileged: readings via `sudo -n ipmitool` and /sys/class/hwmon,
+cap changes via `sudo -n install` + `sudo -n systemctl start ilo-fan-quiet`
+(all covered by /etc/sudoers.d/ilo-fans).
+
+Keys:  +/-  cap +-4      PgUp/PgDn  cap +-16
+       a    apply cap    r  refresh now     q  quit
+"""
+import curses
+import glob
+import locale
+import re
+import subprocess
+import tempfile
+import threading
+import time
+
+def _read_default(key, fallback):
+    try:
+        for line in open("/etc/default/ilo-fan"):
+            line = line.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return fallback
+
+
+ILO_IP = _read_default("ILO_IP", "192.168.1.50")
+CAP_FILE = "/etc/ilo-fan-max"
+SERVICE = "ilo-fan-quiet.service"
+FAN_INTERVAL = 5      # seconds between ipmitool fan polls
+ILO_TEMP_INTERVAL = 15
+
+
+def run(cmd, timeout=25):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except Exception as e:
+        return 1, str(e)
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fans = []            # (name, percent)
+        self.ilo_temps = []       # (name, degC)
+        self.cpu_temps = []       # (label, degC)
+        self.ilo_online = False
+        self.cap = self.read_cap()
+        self.pending = self.cap
+        self.status = "starting..."
+        self.applying = False
+        self.stop = False
+
+    def read_cap(self):
+        try:
+            return int(open(CAP_FILE).read().strip())
+        except Exception:
+            return 32
+
+
+def poll_cpu_temps(st):
+    temps = []
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(hw + "/name").read().strip() != "coretemp":
+                continue
+            pkg = None
+            hi = 0.0
+            for f in glob.glob(hw + "/temp*_label"):
+                label = open(f).read().strip()
+                val = int(open(f.replace("_label", "_input")).read()) / 1000.0
+                if label.startswith("Package"):
+                    pkg = (label, val)
+                else:
+                    hi = max(hi, val)
+            if pkg:
+                temps.append((pkg[0], pkg[1], hi))
+        except Exception:
+            continue
+    with st.lock:
+        st.cpu_temps = sorted(temps)
+
+
+def poll_fans(st):
+    rc, out = run(["sudo", "-n", "ipmitool", "sdr", "type", "fan"])
+    fans = []
+    if rc == 0:
+        for line in out.splitlines():
+            m = re.match(r"\s*(Fan \d+)\s*\|.*\|\s*([\d.]+) percent", line)
+            if m:
+                fans.append((m.group(1), float(m.group(2))))
+    with st.lock:
+        if fans:
+            st.fans = fans
+
+
+def poll_ilo_temps(st):
+    rc, out = run(["sudo", "-n", "ipmitool", "sdr", "type", "temperature"], timeout=30)
+    temps = []
+    if rc == 0:
+        for line in out.splitlines():
+            m = re.match(r"\s*([^|]+?)\s*\|.*\|\s*(\d+)(?:\.\d+)? degrees C", line)
+            if m:
+                temps.append((m.group(1), int(m.group(2))))
+    with st.lock:
+        if temps:
+            st.ilo_temps = temps
+
+
+def poll_ping(st):
+    rc, _ = run(["ping", "-c1", "-W2", ILO_IP], timeout=5)
+    with st.lock:
+        st.ilo_online = (rc == 0)
+
+
+def worker(st):
+    last_ilo_temp = 0.0
+    while not st.stop:
+        poll_cpu_temps(st)
+        poll_ping(st)
+        poll_fans(st)
+        if time.time() - last_ilo_temp > ILO_TEMP_INTERVAL:
+            poll_ilo_temps(st)
+            last_ilo_temp = time.time()
+        with st.lock:
+            st.cap = st.read_cap()
+            if not st.applying:
+                st.status = "ok"
+        for _ in range(FAN_INTERVAL * 4):
+            if st.stop:
+                return
+            time.sleep(0.25)
+
+
+def apply_cap(st):
+    with st.lock:
+        if st.applying:
+            return
+        st.applying = True
+        pending = st.pending
+        st.status = f"applying cap {pending}..."
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(f"{pending}\n")
+            tmp = f.name
+        rc, out = run(["sudo", "-n", "install", "-m", "644", "-o", "root",
+                       "-g", "root", tmp, CAP_FILE])
+        if rc != 0:
+            raise RuntimeError("writing %s failed: %s" % (CAP_FILE, out))
+        rc, out = run(["sudo", "-n", "systemctl", "start", SERVICE], timeout=120)
+        with st.lock:
+            if rc == 0:
+                st.status = (f"cap {pending} applied"
+                             if st.ilo_online else
+                             f"cap {pending} saved (iLO offline - applies when online)")
+            else:
+                st.status = "apply FAILED - check: systemctl status " + SERVICE
+    except Exception as e:
+        with st.lock:
+            st.status = "apply error: %s" % e
+    finally:
+        with st.lock:
+            st.applying = False
+
+
+def bar(pct, width):
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "#" * filled + "-" * (width - filled)
+
+
+def draw(scr, st):
+    scr.erase()
+    h, w = scr.getmaxyx()
+    with st.lock:
+        fans = list(st.fans)
+        ilo_temps = list(st.ilo_temps)
+        cpu = list(st.cpu_temps)
+        online = st.ilo_online
+        cap, pending, status = st.cap, st.pending, st.status
+
+    def put(y, x, s, attr=0):
+        if 0 <= y < h:
+            scr.addnstr(y, x, s, max(0, w - x - 1), attr)
+
+    on = "ONLINE" if online else "OFFLINE"
+    on_attr = curses.color_pair(2) if online else curses.color_pair(3)
+    put(0, 0, " DL380p Gen8 fan control", curses.A_BOLD)
+    put(0, max(0, w - 22), f"iLO {ILO_IP} ")
+    put(0, max(0, w - 8), on, on_attr | curses.A_BOLD)
+    put(1, 0, "-" * (w - 1))
+
+    y = 2
+    for label, pkg, hicore in cpu:
+        col = curses.color_pair(2) if pkg < 60 else (
+              curses.color_pair(4) if pkg < 75 else curses.color_pair(3))
+        put(y, 1, f"CPU {label}: ")
+        put(y, 16, f"{pkg:5.1f} C", col | curses.A_BOLD)
+        put(y, 26, f"(hottest core {hicore:.0f} C)")
+        y += 1
+    if not cpu:
+        put(y, 1, "CPU temps: n/a")
+        y += 1
+
+    y += 1
+    pct_cap = cap / 255 * 100
+    put(y, 1, "FAN CAP: ", curses.A_BOLD)
+    put(y, 10, f"{cap}/255 ({pct_cap:.1f}%)", curses.A_BOLD)
+    if pending != cap:
+        put(y, 32, f"pending: {pending}/255 ({pending / 255 * 100:.1f}%)  [press a to apply]",
+            curses.color_pair(4) | curses.A_BOLD)
+    y += 2
+
+    bw = max(10, min(40, w - 30))
+    for name, pct in fans:
+        col = curses.color_pair(2) if pct < 30 else (
+              curses.color_pair(4) if pct < 60 else curses.color_pair(3))
+        put(y, 1, f"{name:<7}")
+        put(y, 9, "[" + bar(pct, bw) + "]", col)
+        put(y, 12 + bw, f"{pct:5.1f}%", col | curses.A_BOLD)
+        y += 1
+    if not fans:
+        put(y, 1, "fans: waiting for ipmitool...")
+        y += 1
+
+    if ilo_temps:
+        y += 1
+        put(y, 1, "iLO SENSORS", curses.A_BOLD)
+        put(y, 14, "( < 50 ", curses.A_DIM)
+        put(y, 21, "ok", curses.color_pair(2))
+        put(y, 24, "  50-64 ", curses.A_DIM)
+        put(y, 32, "warm", curses.color_pair(4))
+        put(y, 37, "  65+ ", curses.A_DIM)
+        put(y, 43, "hot", curses.color_pair(3))
+        put(y, 46, " )", curses.A_DIM)
+        y += 1
+        cw = 24                       # cell: "# 01-Inlet Ambient  32C"
+        cols = max(1, (w - 2) // cw)
+        rows_used = 0
+        for i, (name, t) in enumerate(ilo_temps):
+            row, col = divmod(i, cols)
+            yy = y + row
+            if yy >= h - 3:
+                break
+            rows_used = max(rows_used, row + 1)
+            xx = 1 + col * cw
+            tcol = (curses.color_pair(2) if t < 50 else
+                    curses.color_pair(4) if t < 65 else curses.color_pair(3))
+            nm = re.sub(r"\s+", " ", name.strip())
+            nm = nm if len(nm) <= 16 else nm[:15] + "~"
+            put(yy, xx, "■", tcol)
+            put(yy, xx + 2, f"{nm:<16}", 0)
+            put(yy, xx + 19, f"{t:>3}C", tcol | curses.A_BOLD)
+        y += rows_used
+
+    put(h - 2, 1, f"status: {status}")
+    put(h - 1, 1, "[+/-] cap +-4   [PgUp/PgDn] +-16   [a]pply   [r]efresh   [q]uit",
+        curses.A_DIM)
+    scr.refresh()
+
+
+def main(scr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    scr.timeout(250)
+
+    st = State()
+    t = threading.Thread(target=worker, args=(st,), daemon=True)
+    t.start()
+
+    while True:
+        draw(scr, st)
+        try:
+            k = scr.getch()
+        except KeyboardInterrupt:
+            break
+        if k in (ord("q"), ord("Q")):
+            break
+        elif k in (ord("+"), ord("=")):
+            st.pending = min(255, st.pending + 4)
+        elif k in (ord("-"), ord("_")):
+            st.pending = max(10, st.pending - 4)
+        elif k == curses.KEY_PPAGE:
+            st.pending = min(255, st.pending + 16)
+        elif k == curses.KEY_NPAGE:
+            st.pending = max(10, st.pending - 16)
+        elif k in (ord("a"), ord("A"), 10):
+            threading.Thread(target=apply_cap, args=(st,), daemon=True).start()
+        elif k in (ord("r"), ord("R")):
+            threading.Thread(target=poll_fans, args=(st,), daemon=True).start()
+            threading.Thread(target=poll_ilo_temps, args=(st,), daemon=True).start()
+    st.stop = True
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(main)

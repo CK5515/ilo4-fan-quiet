@@ -1,0 +1,36 @@
+#!/bin/bash
+# Cap fan PWM on an HP iLO4 running the patched firmware from
+# https://github.com/kendallgoto/ilo4_unlock
+#
+# Config:
+#   /etc/default/ilo-fan    ILO_IP, FAN_COUNT   (world-readable)
+#   /etc/ilo-fanctl.conf    ILO_USER, ILO_PASS  (root only)
+#   /etc/ilo-fan-max        fan cap, 0-255      (world-readable)
+set -u
+. /etc/default/ilo-fan
+. /etc/ilo-fanctl.conf
+FAN_MAX=32
+[ -r /etc/ilo-fan-max ] && FAN_MAX=$(tr -dc 0-9 < /etc/ilo-fan-max)
+: "${FAN_COUNT:=6}"
+
+SSH_OPTS=(-oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null
+  -oKexAlgorithms=+diffie-hellman-group14-sha1
+  -oHostKeyAlgorithms=+ssh-rsa
+  -oPubkeyAcceptedAlgorithms=+ssh-rsa
+  -oCiphers=+aes256-cbc,aes128-cbc,3des-cbc
+  -oMACs=+hmac-sha1
+  -oConnectTimeout=10 -oNumberOfPasswordPrompts=1 -oLogLevel=ERROR)
+
+ilo_cmd() { sshpass -p "$ILO_PASS" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$1" </dev/null; }
+
+ping -c1 -W3 "$ILO_IP" >/dev/null 2>&1 || { echo "iLO $ILO_IP unreachable, skipping"; exit 0; }
+
+rc=0
+for ((f = 0; f < FAN_COUNT; f++)); do
+  if ilo_cmd "fan p $f max $FAN_MAX" >/dev/null 2>&1; then
+    echo "fan $f: max capped at $FAN_MAX/255"
+  else
+    echo "fan $f: FAILED to apply cap" >&2; rc=1
+  fi
+done
+exit $rc

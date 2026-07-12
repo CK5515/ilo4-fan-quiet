@@ -1,0 +1,9 @@
+[Unit]
+Description=Reapply iLO4 fan caps periodically
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

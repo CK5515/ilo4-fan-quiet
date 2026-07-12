@@ -1,0 +1,7 @@
+[Unit]
+Description=Cap iLO4 fan speeds (quiet mode)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ilo-fan-quiet
