@@ -7,7 +7,7 @@ running the patched iLO4 firmware from
 The patched firmware exposes `fan` commands over the iLO's SSH CLI, but any
 settings you make are lost whenever the iLO resets. This project makes them
 stick: a small script caps every fan's PWM at a value you choose, and a
-systemd timer reapplies the cap at boot and every 10 minutes — so the fans
+systemd timer reapplies the cap at boot and every 10 minutes -> so the fans
 stay quiet forever, even across host reboots and iLO resets.
 
 It also ships `ilo-fan-tui`, a terminal dashboard for monitoring and tuning:
@@ -38,7 +38,7 @@ It also ships `ilo-fan-tui`, a terminal dashboard for monitoring and tuning:
   (this project does **not** flash firmware).
 - A network path from the host to the iLO (dedicated iLO port cabled to your
   LAN, or a direct patch cable from the iLO port into one of the host's NICs).
-- An iLO user for SSH — the installer can create one for you via `hponcfg`
+- An iLO user for SSH -> the installer can create one for you via `hponcfg`
   when run on the server itself.
 - Debian/Ubuntu packages: `sshpass`, `ipmitool` (for the TUI), `python3`.
 
@@ -87,7 +87,7 @@ cap changes.
 
 ## A word of caution
 
-Capping fans reduces airflow for **everything** in the chassis — DIMMs, VRMs,
+Capping fans reduces airflow for **everything** in the chassis -> DIMMs, VRMs,
 drives, and PCIe cards don't care how good your CPU cooling is. Watch the
 sensor grid in `ilo-fan-tui` after lowering the cap, especially under
 sustained load, and raise the cap if anything trends past ~65 °C. The iLO's
